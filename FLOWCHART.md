@@ -29,25 +29,26 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A["Client<br/>POST /query {question}"] --> B{"question<br/>non-empty?"}
+    A["Client<br/>POST /query {question, filenames?}"] --> B{"question<br/>non-empty?"}
     B -- no --> B1["HTTP 400<br/>question must not be empty"]
-    B -- yes --> C["engine.answer(question)"]
+    B -- yes --> C["engine.answer(question, filenames)"]
 
     subgraph answer ["RAGEngine.answer"]
         C --> D["retrieve<br/>(threadpool)"]
         subgraph retrieval ["Retrieval chain"]
-            D --> E["Dense + sparse<br/>Pinecone query"]
-            E --> F["Cohere rerank"]
-            F --> G["Top-K docs"]
+            D --> E["Dense top-30 + sparse top-30<br/>Pinecone, filtered to filenames"]
+            E --> E2["Weighted RRF fusion"]
+            E2 --> F["Rerank: Cohere rerank-v3.5<br/>→ bge-reranker-v2-m3 → fused order"]
+            F --> G["Top-5 docs"]
         end
         G --> H{"any docs?"}
         H -- no --> H1["answer = 'no indexed<br/>documents' · empty lists"]
-        H -- yes --> I["Format context<br/>(citation-tagged blocks)"]
-        I --> J["generation_chain.ainvoke<br/>Gemini → structured RAGAnswer"]
-        J --> K["Build citations<br/>from doc metadata"]
+        H -- yes --> I["Format context<br/>(numbered [n] blocks)"]
+        I --> J["Gemini → structured RAGAnswer<br/>(fallback models on 429/503)"]
+        J --> K["Citations from doc metadata,<br/>flag the [n] the answer cites"]
     end
 
-    K --> L["HTTP 200<br/>{answer, insights,<br/>next_questions, citations}"]
+    K --> L["HTTP 200<br/>{answer, insights, next_questions,<br/>citations, model, reranker, timings}"]
     H1 --> L
     C -. exception .-> Z["HTTP 500<br/>Query failed"]
 ```

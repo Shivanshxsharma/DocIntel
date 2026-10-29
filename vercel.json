@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "sh deploy/build_static.sh",
+  "outputDirectory": "public",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 60,
+      "includeFiles": "{backend/*.py,deploy/library.json,eval/results/summary.json}"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index" }
+  ]
+}

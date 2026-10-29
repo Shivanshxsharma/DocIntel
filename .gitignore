@@ -42,3 +42,24 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Benchmark: API-call cache, raw QASPER parquet and downloaded PDFs are
+# reproducible (eval/build_dataset.py, eval/bench.py). Results + subset are kept.
+eval/cache/
+eval/data/raw/
+eval/data/papers/
+eval/data/build_log.txt
+backend/uploads/manifest.json
+.claude/
+
+# Deploy build output / local tooling
+public/
+.vercel/
+.venv-serve/
+
+# Not part of DocIntel (GitHub profile banner assets)
+photo.jpeg
+generate_banner.py
+
+# Personal study notes
+notes/

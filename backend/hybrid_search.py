@@ -1,14 +1,17 @@
 """
 Hybrid Search RAG — LangChain Parallel Chain
 =============================================
-Dense (Pinecone SDK + Google Embeddings) + Sparse (BM25) retrieval
-using LangChain's RunnableParallel for parallel execution and
-RunnableLambda for RRF fusion, followed by a Cohere cross-encoder
-rerank step that narrows the fused candidates to the final results.
+Dense (Pinecone + Gemini or Pinecone-hosted embeddings) + sparse (Pinecone
+learned-sparse) retrieval using LangChain's RunnableParallel for parallel
+execution and RunnableLambda for RRF fusion, followed by a cross-encoder rerank
+step (Cohere, with a Pinecone-hosted fallback) that narrows the fused candidates.
 
 Ingest: Docling (PDF→DoclingDocument) → HybridChunker (structure + token aware,
-        page-tracked) → Gemini embeddings → Pinecone.
-Query:  retrieve wide (RETRIEVE_K each) → RRF fuse → Cohere rerank → top FINAL_K
+        page-tracked) → dense + sparse embeddings → Pinecone.
+Query:  retrieve wide (RETRIEVE_K each, optionally scoped to some documents)
+        → RRF fuse → rerank → top FINAL_K
+
+Benchmarked against a standard PyPDF + fixed-size-chunk RAG in ../eval/.
 
 PDFs are loaded from the ./uploads folder.
 Run:  python hybrid_search.py
@@ -21,29 +24,25 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cohere
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import (
-    PdfPipelineOptions,
-    AcceleratorOptions,
-    AcceleratorDevice,
-)
-from docling.datamodel.document import DoclingDocument
-from docling.chunking import HybridChunker
-from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
-from transformers import AutoTokenizer
-
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.documents import Document
+
+# Docling + transformers (PyTorch underneath) are only needed to INGEST a PDF.
+# They are imported inside the ingestion functions, so the query path (and a
+# read-only serverless deployment) never loads several GB of ML dependencies.
+if TYPE_CHECKING:
+    from docling.datamodel.document import DoclingDocument
+    from docling.document_converter import DocumentConverter
+    from docling.chunking import HybridChunker
 from langchain_core.runnables import (
     RunnableParallel,
     RunnableLambda,
-    RunnablePassthrough,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,16 +78,43 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "rag-hybrid-search")
 # what makes the engine stateless: nothing to rebuild in memory on upload.
 PINECONE_SPARSE_INDEX_NAME = os.getenv("PINECONE_SPARSE_INDEX_NAME", "sprase-index")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
-EMBEDDING_MODEL = "gemini-embedding-2-preview"
-# gemini-embedding-2-preview returns 3072-dim vectors by default (native,
-# already L2-normalized). The Pinecone index dimension MUST match this.
-EMBEDDING_DIM = 3072
+# Optional namespace inside both indexes — isolates one corpus (or one user)
+# from another without creating more indexes. "" = Pinecone's default namespace.
+PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "")
+
+# Dense embedding provider:
+#   gemini   — gemini-embedding-2-preview, 3072-dim (original setup). The Gemini
+#              free tier allows 1,000 embedded chunks/day ≈ 20 papers/day.
+#   pinecone — llama-text-embed-v2 hosted by Pinecone, 1024-dim. Same account as
+#              the indexes, no daily cap; the model the benchmark (eval/) uses.
+# The dense index dimension MUST match the provider, so switching providers
+# means pointing PINECONE_INDEX_NAME at a new index (auto-created on startup).
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "gemini").lower()
+if EMBEDDING_PROVIDER == "pinecone":
+    EMBEDDING_MODEL = "llama-text-embed-v2"
+    EMBEDDING_DIM = 1024
+else:
+    EMBEDDING_MODEL = "gemini-embedding-2-preview"
+    # gemini-embedding-2-preview returns 3072-dim vectors by default (native,
+    # already L2-normalized).
+    EMBEDDING_DIM = 3072
 # Pinecone-hosted sparse embedding model (DeepImpact-style learned sparse).
 # 512-token max sequence — lines up with our MAX_TOKENS=512 chunking.
 SPARSE_MODEL = "pinecone-sparse-english-v0"
 # Pinecone inference embed accepts at most 96 inputs per call.
 SPARSE_EMBED_BATCH = 96
 RERANK_MODEL = "rerank-v3.5"
+# Fallback reranker, hosted by Pinecone (same key as the indexes). Used when
+# Cohere is unavailable or rate-limited (a trial key allows 10 calls/minute)
+# so a busy minute degrades to a different cross-encoder instead of silently
+# dropping reranking altogether.
+FALLBACK_RERANK_MODEL = "bge-reranker-v2-m3"
+# Optional: fuse the reranker's order with the first-stage (RRF) order instead
+# of trusting the cross-encoder alone. On QASPER the cross-encoder tends to put
+# a paper's abstract first; fusion lifts Hit@1 51.5% vs 44.9% and MRR 0.655 vs
+# 0.612, but lowers Hit@5 88.2% vs 90.4% (none significant at p<0.05). Off by
+# default because the LLM reads the whole top-5. See eval/results/RESULTS.md.
+RERANK_FUSION = os.getenv("RERANK_FUSION", "").lower() in ("1", "true", "yes")
 # Chunking: Docling HybridChunker runs on the DoclingDocument directly (NOT
 # exported Markdown), so each chunk keeps its page provenance for citations.
 # It is tokenization-aware: it splits chunks over MAX_TOKENS and merges
@@ -124,6 +150,14 @@ def _make_docling_converter() -> DocumentConverter:
       • Table-structure recognition ON — academic tables export as proper
         Markdown tables instead of scrambled text.
     """
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import (
+        AcceleratorDevice,
+        AcceleratorOptions,
+        PdfPipelineOptions,
+    )
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = False
     pipeline_options.do_table_structure = True
@@ -192,6 +226,10 @@ def _make_hybrid_chunker() -> HybridChunker:
     (combine undersized adjacent chunks that share the same headings).
     Sized with an HF tokenizer as a proxy for Gemini's (approximate; see config).
     """
+    from docling.chunking import HybridChunker
+    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+    from transformers import AutoTokenizer
+
     tokenizer = HuggingFaceTokenizer(
         tokenizer=AutoTokenizer.from_pretrained(TOKENIZER_MODEL),
         max_tokens=MAX_TOKENS,
@@ -288,6 +326,58 @@ def ensure_pinecone_index() -> Pinecone:
     return pc
 
 
+class PineconeEmbeddings:
+    """
+    Minimal LangChain-style embeddings client for Pinecone's hosted dense model.
+
+    Same interface the engine uses on GoogleGenerativeAIEmbeddings
+    (embed_documents / embed_query), with the passage/query asymmetry the model
+    was trained for.
+    """
+
+    def __init__(self, pc: Pinecone, model: str = "llama-text-embed-v2", batch: int = 48) -> None:
+        self.pc, self.model, self.batch = pc, model, batch
+
+    def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self.batch):
+            resp = self.pc.inference.embed(
+                model=self.model,
+                inputs=texts[i : i + self.batch],
+                parameters={"input_type": input_type, "truncate": "END"},
+            )
+            out.extend(e.values for e in resp.data)
+        return out
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed(texts, "passage")
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([text], "query")[0]
+
+
+def make_embeddings(pc: Pinecone):
+    """The configured dense embedding client (see EMBEDDING_PROVIDER)."""
+    if EMBEDDING_PROVIDER == "pinecone":
+        return PineconeEmbeddings(pc, EMBEDDING_MODEL)
+    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+
+
+def _filename_filter(filenames: list[str] | None) -> dict | None:
+    """Pinecone metadata filter that scopes a query to specific documents."""
+    return {"filename": {"$in": list(filenames)}} if filenames else None
+
+
+def delete_chunks(pc: Pinecone, ids: list[str]) -> None:
+    """Remove vectors by ID from BOTH indexes (stale chunks / deleted documents)."""
+    if not ids:
+        return
+    for name in (PINECONE_INDEX_NAME, PINECONE_SPARSE_INDEX_NAME):
+        index = pc.Index(name)
+        for i in range(0, len(ids), 1000):
+            index.delete(ids=ids[i : i + 1000], namespace=PINECONE_NAMESPACE)
+
+
 def make_chunk_id(chunk: Document) -> str:
     """
     Deterministic vector ID derived from the chunk's source + content.
@@ -339,7 +429,7 @@ def index_chunks_to_pinecone(
             }
             vectors_to_upsert.append((vec_id, vector, metadata))
 
-        index.upsert(vectors=vectors_to_upsert)
+        index.upsert(vectors=vectors_to_upsert, namespace=PINECONE_NAMESPACE)
 
     print(f"  Upserted {len(chunks)} dense vectors to '{PINECONE_INDEX_NAME}'.")
 
@@ -407,7 +497,7 @@ def index_sparse_to_pinecone(
                 {"id": vec_id, "sparse_values": sparse, "metadata": metadata}
             )
 
-        index.upsert(vectors=vectors_to_upsert)
+        index.upsert(vectors=vectors_to_upsert, namespace=PINECONE_NAMESPACE)
 
     print(f"  Upserted {len(chunks)} sparse vectors to '{PINECONE_SPARSE_INDEX_NAME}'.")
 
@@ -421,17 +511,20 @@ def make_dense_retriever_fn(
     top_k: int = RETRIEVE_K,
 ):
     """
-    Returns a function: query (str) -> list[Document]
-    that queries Pinecone directly using the SDK.
+    Returns a function: {"query": str, "filenames": list|None} -> list[Document]
+    that queries Pinecone directly using the SDK. `filenames` (optional) scopes
+    the search to those documents via a metadata filter.
     """
     index = pc.Index(PINECONE_INDEX_NAME)
 
-    def retrieve(query: str) -> list[Document]:
-        query_vector = embeddings.embed_query(query)
+    def retrieve(payload: dict) -> list[Document]:
+        query_vector = embeddings.embed_query(payload["query"])
         results = index.query(
             vector=query_vector,
             top_k=top_k,
             include_metadata=True,
+            namespace=PINECONE_NAMESPACE,
+            filter=_filename_filter(payload.get("filenames")),
         )
         docs = []
         for match in results.matches:
@@ -460,7 +553,7 @@ def make_sparse_retriever_fn(
     top_k: int = RETRIEVE_K,
 ):
     """
-    Returns a function: query (str) -> list[Document]
+    Returns a function: {"query": str, "filenames": list|None} -> list[Document]
 
     The server-side counterpart of the old in-memory BM25Retriever: it sparse-
     embeds the query (input_type='query') and queries the sparse Pinecone index
@@ -469,12 +562,14 @@ def make_sparse_retriever_fn(
     """
     index = pc.Index(PINECONE_SPARSE_INDEX_NAME)
 
-    def retrieve(query: str) -> list[Document]:
-        sparse = embed_sparse(pc, [query], input_type="query")[0]
+    def retrieve(payload: dict) -> list[Document]:
+        sparse = embed_sparse(pc, [payload["query"]], input_type="query")[0]
         results = index.query(
             sparse_vector=sparse,
             top_k=top_k,
             include_metadata=True,
+            namespace=PINECONE_NAMESPACE,
+            filter=_filename_filter(payload.get("filenames")),
         )
         docs = []
         for match in results.matches:
@@ -545,10 +640,25 @@ def make_reranker_fn(top_n: int = FINAL_K):
     Sends the fused candidate list to Cohere's cross-encoder, which scores each
     (query, document) pair jointly (unlike the bi-encoder embeddings used for
     dense retrieval) and returns the top_n most relevant docs, re-sorted, each
-    tagged with a `rerank_score`. If Cohere errors, we fall back to the fused
-    order so a transient API issue degrades gracefully instead of crashing.
+    tagged with a `rerank_score` and the `reranker` that produced it.
+
+    Fallback chain, so a rate-limited or failing reranker never takes the query
+    down — and never silently loses reranking:
+        Cohere rerank-v3.5  →  Pinecone-hosted bge-reranker-v2-m3  →  fused order
     """
     client = cohere.ClientV2(api_key=COHERE_API_KEY)
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+
+    def _cohere(query: str, texts: list[str], n: int) -> list[tuple[int, float]]:
+        resp = client.rerank(model=RERANK_MODEL, query=query, documents=texts, top_n=n)
+        return [(r.index, r.relevance_score) for r in resp.results]
+
+    def _pinecone(query: str, texts: list[str], n: int) -> list[tuple[int, float]]:
+        resp = pc.inference.rerank(
+            model=FALLBACK_RERANK_MODEL, query=query, documents=texts, top_n=n,
+            return_documents=False, parameters={"truncate": "END"},
+        )
+        return [(r.index, r.score) for r in resp.data]
 
     def rerank(payload: dict) -> list[Document]:
         query: str = payload["query"]
@@ -557,23 +667,35 @@ def make_reranker_fn(top_n: int = FINAL_K):
         if not docs:
             return []
 
-        try:
-            response = client.rerank(
-                model=RERANK_MODEL,
-                query=query,
-                documents=[d.page_content for d in docs],
-                top_n=min(top_n, len(docs)),
-            )
-        except Exception as exc:  # noqa: BLE001 — degrade to fused order
-            print(f"  [WARN] Cohere rerank failed ({exc}); using fused order.")
-            return docs[:top_n]
+        texts = [d.page_content for d in docs]
+        # Fusion needs the reranker's full ordering, not just its top_n.
+        n = len(docs) if RERANK_FUSION else min(top_n, len(docs))
+        for name, fn in ((RERANK_MODEL, _cohere), (FALLBACK_RERANK_MODEL, _pinecone)):
+            try:
+                ranked = fn(query, texts, n)
+            except Exception as exc:  # noqa: BLE001 — try the next reranker
+                print(f"  [WARN] {name} rerank failed ({str(exc)[:120]}); falling back.")
+                continue
+            if RERANK_FUSION:
+                # docs arrive in fused (RRF) order, so index == first-stage rank.
+                rr_rank = {idx: r for r, (idx, _) in enumerate(ranked)}
+                score = dict(ranked)
+                order = sorted(
+                    range(len(docs)),
+                    key=lambda i: -(1 / (61 + i) + 1 / (61 + rr_rank.get(i, len(docs)))),
+                )
+                ranked = [(i, score.get(i, 0.0)) for i in order[:top_n]]
+            reranked: list[Document] = []
+            for idx, score in ranked:
+                doc = docs[idx]
+                doc.metadata["rerank_score"] = round(float(score), 6)
+                doc.metadata["reranker"] = name
+                reranked.append(doc)
+            return reranked
 
-        reranked: list[Document] = []
-        for result in response.results:
-            doc = docs[result.index]
-            doc.metadata["rerank_score"] = round(result.relevance_score, 6)
-            reranked.append(doc)
-        return reranked
+        for doc in docs[:top_n]:
+            doc.metadata["reranker"] = "none (fused order)"
+        return docs[:top_n]
 
     return rerank
 
@@ -624,10 +746,11 @@ def build_retrieval_chain(
     reranker = RunnableLambda(make_reranker_fn(final_k))
 
     # ── LCEL Chain: fuse, carry the query alongside, then rerank ──────────
+    # Input: {"query": str, "filenames": list[str] | None}
     hybrid_chain = (
         RunnableParallel(
             docs=fusion_chain,
-            query=RunnablePassthrough(),
+            query=RunnableLambda(lambda payload: payload["query"]),
         )
         | reranker
     )
@@ -693,7 +816,7 @@ def main():
     if not PINECONE_API_KEY:
         print("[ERROR] PINECONE_API_KEY not set in .env")
         return
-    if not os.getenv("GOOGLE_API_KEY"):
+    if EMBEDDING_PROVIDER == "gemini" and not os.getenv("GOOGLE_API_KEY"):
         print("[ERROR] GOOGLE_API_KEY not set in .env")
         return
     if not COHERE_API_KEY:
@@ -711,7 +834,7 @@ def main():
 
     print("\n[3/4] Setting up Pinecone + building chain …")
     pc = ensure_pinecone_index()
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    embeddings = make_embeddings(pc)
 
     t0 = time.time()
     hybrid_chain = build_hybrid_chain(pc, chunks, embeddings)
@@ -731,7 +854,7 @@ def main():
             break
 
         t0 = time.time()
-        results = hybrid_chain.invoke(query)
+        results = hybrid_chain.invoke({"query": query, "filenames": None})
         elapsed = time.time() - t0
 
         print_results(query, results)

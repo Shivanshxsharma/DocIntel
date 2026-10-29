@@ -1,0 +1,38 @@
+{
+ "rag-lewis-2020.pdf": {
+  "title": "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+  "chunks": 60,
+  "pages": 19,
+  "uploaded_at": "2026-10-29T11:51:12+00:00"
+ },
+ "attention-is-all-you-need.pdf": {
+  "title": "Attention Is All You Need",
+  "chunks": 42,
+  "pages": 15,
+  "uploaded_at": "2026-10-29T11:52:07+00:00"
+ },
+ "bert-devlin-2018.pdf": {
+  "title": "BERT: Pre-training of Deep Bidirectional Transformers",
+  "chunks": 54,
+  "pages": 16,
+  "uploaded_at": "2026-10-29T11:53:07+00:00"
+ },
+ "1912.11637.pdf": {
+  "title": "Explicit Sparse Transformer",
+  "chunks": 41,
+  "pages": 15,
+  "uploaded_at": "2026-10-14T15:30:48+00:00"
+ },
+ "1610.06510.pdf": {
+  "title": "Learning Variable-Length Units for SMT via Byte Pair Encoding",
+  "chunks": 49,
+  "pages": 11,
+  "uploaded_at": "2026-10-14T15:31:45+00:00"
+ },
+ "1911.09709.pdf": {
+  "title": "Automatically Neutralizing Subjective Bias in Text",
+  "chunks": 42,
+  "pages": 10,
+  "uploaded_at": "2026-10-14T15:32:19+00:00"
+ }
+}
